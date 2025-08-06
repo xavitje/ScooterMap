@@ -1,292 +1,323 @@
-import tkinter as tk
-from tkinter import ttk, messagebox
+import folium
+from flask import Flask, render_template_string, request
 import osmnx as ox
 import networkx as nx
 from geopy.geocoders import Nominatim
-from tkintermapview import TkinterMapView
+import math
+import requests
+from geopy.distance import great_circle
+import networkx as nx
 
+# OSMnx configuratie
 ox.settings.log_console = True
 ox.settings.use_cache = True
-ox.settings.timeout = 300  # 5 minuten timeout
+ox.settings.timeout = 300
 
+app = Flask(__name__)
+geolocator = Nominatim(user_agent="scooter_navigator", timeout=10)
 
-class ScooterNavigator:
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>🚀 Scooter Navigator Pro (Web)</title>
+    <meta charset="utf-8"/>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
+        .container { display: flex; flex-direction: column; height: 100vh; }
+        .controls { background: #f0f0f0; padding: 15px; border-radius: 5px; margin-bottom: 10px; }
+        #map { flex: 1; border: 1px solid #ccc; border-radius: 5px; }
+        input, button { padding: 8px; margin: 5px; }
+        button { background: #4285f4; color: white; border: none; cursor: pointer; }
+        .route-info { background: #e8f4ff; padding: 10px; border-radius: 5px; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="controls">
+            <h2>Scooter Navigator Pro</h2>
+            <form method="POST">
+                <input type="text" name="start_address" placeholder="Startadres" value="{{ start_address }}" size="40">
+                <input type="text" name="end_address" placeholder="Eindadres" value="{{ end_address }}" size="40">
+                <button type="submit">Route berekenen</button>
+            </form>
+            {% if route_stats %}
+            <div class="route-info">
+                <h3>Route-informatie</h3>
+                <p>{{ route_stats }}</p>
+                <p><strong>Wegtypen:</strong><br>{{ road_types }}</p>
+            </div>
+            {% endif %}
+        </div>
+        <div id="map">{{ map_html|safe }}</div>
+    </div>
+</body>
+</html>
+"""
+class ScooterRoutePlanner:
+    def __init__(self):
+        self.overpass_url = "https://overpass-api.de/api/interpreter"
+        self.graph = nx.Graph()
+        self.nodes = {}  # Bewaar node coördinaten
 
-    def __init__(self, root):
-        print("Scooter Navigator Pro is gestart!")
-        self.root = root
-        self.root.title("🚀 Scooter Navigator Pro")
-        self.root.geometry("1000x800")
+    def _get_osm_data(self, bbox, retry=3):
+        """Verbeterde data-fetching met retry-logica"""
+        query = f"""
+        [out:json][timeout:180];
+        (
+            way["highway"]["access"!~"no|private"]
+            ["motor_vehicle"!~"no"]
+            ["motorcycle"!~"no"]
+            ({" ".join(bbox)});
+            node(w);
+        );
+        out body;
+        >;
+        out skel qt;
+        """
+        for attempt in range(retry):
+            try:
+                response = requests.post(self.overpass_url, data=query, timeout=30)
+                return response.json()
+            except Exception as e:
+                if attempt == retry-1:
+                    raise ValueError(f"Overpass API error: {str(e)}")
+                time.sleep(2)
 
-        # Adres invoervelden
-        self.address_frame = ttk.Frame(root)
-        self.address_frame.pack(pady=10, padx=10, fill=tk.X)
-
-        ttk.Label(self.address_frame, text="Startadres:").pack(side=tk.LEFT)
-        self.start_address_entry = ttk.Entry(self.address_frame, width=40)
-        self.start_address_entry.pack(side=tk.LEFT, padx=5)
-
-        ttk.Label(self.address_frame, text="Eindadres:").pack(side=tk.LEFT)
-        self.end_address_entry = ttk.Entry(self.address_frame, width=40)
-        self.end_address_entry.pack(side=tk.LEFT, padx=5)
-
-        self.btn_find_address = ttk.Button(self.address_frame,
-                                           text="Adressen zoeken",
-                                           command=self.locate_addresses)
-        self.btn_find_address.pack(side=tk.LEFT)
-
-        # Kaart widget
-        self.map_widget = TkinterMapView(root, width=980, height=600)
-        self.map_widget.pack(pady=10, padx=10)
-
-        # Markers en route
-        self.start_marker = None
-        self.end_marker = None
-        self.route_line = None
-
-        # Knoppen voor handmatige selectie
-        self.control_frame = ttk.Frame(root)
-        self.control_frame.pack(pady=10)
-
-        ttk.Button(self.control_frame,
-                   text="📌 Handmatig startpunt",
-                   command=self.set_start).pack(side=tk.LEFT, padx=5)
-        ttk.Button(self.control_frame,
-                   text="🏁 Handmatig eindpunt",
-                   command=self.set_end).pack(side=tk.LEFT, padx=5)
-        ttk.Button(self.control_frame,
-                   text="🚀 Route berekenen",
-                   command=self.calculate_route,
-                   style="Accent.TButton").pack(side=tk.LEFT, padx=5)
-        ttk.Button(self.control_frame,
-                   text="❌ Alles wissen",
-                   command=self.clear_all).pack(side=tk.LEFT, padx=5)
-
-        # Initieel scherm
-        self.map_widget.set_position(52.3676, 4.9041)  # Amsterdam
-        self.map_widget.set_zoom(14)
-        self.geolocator = Nominatim(user_agent="scooter_navigator", timeout=10)
-
-    def locate_addresses(self):
-        """Zoek coördinaten voor ingevoerde adressen"""
+    def calculate_route(self, start_coords, end_coords):
+        """Verbeterde routeberekening met fallback"""
+        # Vergroot de bounding box (+/- 0.02 graden ~ 2km)
+        bbox = [
+            f"{min(start_coords[0], end_coords[0])-0.02}",
+            f"{min(start_coords[1], end_coords[1])-0.02}",
+            f"{max(start_coords[0], end_coords[0])+0.02}",
+            f"{max(start_coords[1], end_coords[1])+0.02}"
+        ]
+        
+        data = self._get_osm_data(bbox)
+        self._build_graph(data)
+        
+        start_node = self._find_nearest_node(start_coords)
+        end_node = self._find_nearest_node(end_coords)
+        
         try:
-            # Startadres zoeken
-            start_address = self.start_address_entry.get()
-            if start_address:
-                start_location = self.geolocator.geocode(start_address +
-                                                         ", Nederland")
-                if start_location:
-                    self.map_widget.set_position(start_location.latitude,
-                                                 start_location.longitude)
-                    self.set_start_position(start_location.latitude,
-                                            start_location.longitude)
+            # Probeer eerst strikte route (alleen moped=yes)
+            node_path = nx.shortest_path(
+                self.graph, start_node, end_node,
+                weight='weight'
+            )
+            return self._process_route(node_path)
+            
+        except nx.NetworkXNoPath:
+            # Fallback: probeer minder strikte route
+            try:
+                node_path = nx.shortest_path(
+                    self.graph, start_node, end_node,
+                    weight='fallback_weight'
+                )
+                return self._process_route(node_path, is_fallback=True)
+            except:
+                raise ValueError("Geen route gevonden, zelfs niet met fallback")
 
-            # Eindadres zoeken
-            end_address = self.end_address_entry.get()
-            if end_address:
-                end_location = self.geolocator.geocode(end_address +
-                                                       ", Nederland")
-                if end_location:
-                    self.set_end_position(end_location.latitude,
-                                          end_location.longitude)
+    def _build_graph(self, data):
+        """Bouw graaf met extra fallback-logica"""
+        for element in data['elements']:
+            if element['type'] == 'node':
+                self.nodes[element['id']] = (element['lat'], element['lon'])
+                
+            elif element['type'] == 'way':
+                tags = element.get('tags', {})
+                is_allowed = self._is_way_allowed(tags)
+                
+                for i in range(len(element['nodes'])-1):
+                    u, v = element['nodes'][i], element['nodes'][i+1]
+                    if u in self.nodes and v in self.nodes:
+                        # Hoofdgewicht (strikt beleid)
+                        weight = 100 if not is_allowed else self._calculate_weight(tags)
+                        
+                        # Fallback gewicht (minder strikt)
+                        fallback_weight = 10 if not is_allowed else 1
+                        
+                        self.graph.add_edge(
+                            u, v,
+                            weight=weight,
+                            fallback_weight=fallback_weight,
+                            coords=(self.nodes[u], self.nodes[v]),
+                            tags=tags
+                        )
 
-        except Exception as e:
-            messagebox.showerror("Fout", f"Adres niet gevonden: {str(e)}")
-
-    def set_start_position(self, lat, lon):
-        """Plaats startmarker op specifieke coördinaten"""
-        if self.start_marker:
-            self.start_marker.delete()
-        self.start_marker = self.map_widget.set_marker(
-            lat,
-            lon,
-            text="Start",
-            marker_color_circle="blue",
-            marker_color_outside="white",
-            text_color="blue")
-
-    def set_end_position(self, lat, lon):
-        """Plaats eindmarker op specifieke coördinaten"""
-        if self.end_marker:
-            self.end_marker.delete()
-        self.end_marker = self.map_widget.set_marker(
-            lat,
-            lon,
-            text="Eind",
-            marker_color_circle="red",
-            marker_color_outside="white",
-            text_color="red")
-
-    def set_start(self):
-        """Handmatig startpunt instellen via kaartklik"""
-        pos = self.map_widget.get_position()
-        self.set_start_position(pos[0], pos[1])
-        self.start_address_entry.delete(0, tk.END)
-        self.start_address_entry.insert(0,
-                                        self.reverse_geocode(pos[0], pos[1]))
-
-    def set_end(self):
-        """Handmatig eindpunt instellen via kaartklik"""
-        pos = self.map_widget.get_position()
-        self.set_end_position(pos[0], pos[1])
-        self.end_address_entry.delete(0, tk.END)
-        self.end_address_entry.insert(0, self.reverse_geocode(pos[0], pos[1]))
-
-    def reverse_geocode(self, lat, lon):
-        """Zoek adres bij coördinaten"""
-        try:
-            location = self.geolocator.reverse(f"{lat}, {lon}")
-            return location.address.split(",")[0]  # Korte adresweergave
-        except:
-            return f"{lat:.5f}, {lon:.5f}"
-
-    def calculate_route(self):
-        """Geavanceerde routeberekening voor scooters/brommers."""
-        if not (self.start_marker and self.end_marker):
-            messagebox.showerror("Fout", "Selecteer eerst start- en eindpunt")
-            return
-
-        try:
-            start_lat, start_lon = self.start_marker.position
-            end_lat, end_lon = self.end_marker.position
-
-            # Download kaartdata met custom filters
-            G = ox.graph_from_point(
-                (start_lat, start_lon),
-                dist=5000,
-                custom_filter=('["highway"]["access"!~"private|no"]'
-                               '["motor_vehicle"!~"no"]'
-                               '["motorcycle"!~"no"]'),
-                simplify=True)
-
-            # Wegtype prioritering (aanpasbaar)
-            road_priority = {
-                'cycleway': 1,  # Fietspaden (hoogste prioriteit)
-                'living_street': 2,
-                'residential': 3,
-                'service': 4,
-                'secondary': 5,
-                'primary': 6,
-                'trunk': 7,
-                'motorway': 8  # Vermijden (laagste prioriteit)
-            }
-
-            # Pas edge weights aan op basis van wegtype
-            for u, v, k, data in G.edges(keys=True, data=True):
-                highway_type = data.get('highway', '')
-                if isinstance(highway_type, list):
-                    highway_type = highway_type[0]
-
-                # Stel gewicht in op basis van prioriteit
-                data['weight'] = road_priority.get(highway_type, 5) * data.get(
-                    'length', 1)
-
-                # Speciale cases voor NL:
-                if 'bicycle_road' in data or 'cyclestreet' in data:
-                    data['weight'] *= 0.8  # Geef fietspaden extra gewicht
-
-                if 'moped' in data.get('access', ''):
-                    data[
-                        'weight'] *= 1.2  # Ontmoedig wegen waar brommers niet mogen
-
-            # Bereken route met aangepaste gewichten
-            start_node = ox.nearest_nodes(G, X=[start_lon], Y=[start_lat])[0]
-            end_node = ox.nearest_nodes(G, X=[end_lon], Y=[end_lat])[0]
-
-            route = nx.shortest_path(G, start_node, end_node, weight="weight")
-
-            # Visualisatie
-            self.draw_route(G, route)
-
-            # Toon route-info
-            self.show_route_stats(G, route)
-
-        except Exception as e:
-            messagebox.showerror("Fout", f"Fout in routeberekening:\n{str(e)}")
-
-    def draw_route(self, G, route):
-        """Teken de route met kleurcodering voor wegtypen"""
-        try:
-            route_edges = list(zip(route[:-1], route[1:]))
-            colors = []
-
-            for u, v in route_edges:
-                edge_data = G.get_edge_data(u, v)[0]
-                wegtype = edge_data.get('highway', 'road')
-
-                if 'cycleway' in wegtype:
-                    colors.append("#4CAF50")  # Groen voor fietspaden
-                elif 'residential' in wegtype:
-                    colors.append("#FFC107")  # Geel voor woonstraten
-                else:
-                    colors.append("#2196F3")  # Blauw voor andere wegen
-
-            route_coords = [(G.nodes[node]["y"], G.nodes[node]["x"])
-                            for node in route]
-
-            # Verwijder oude route (als die bestaat)
-            if self.route_line:
-                self.map_widget.delete(self.route_line)
-
-            # Teken nieuwe route (ZONDER arrow=True)
-            self.route_line = self.map_widget.set_path(
-                route_coords,
-                color=colors if len(colors) == len(route_coords) -
-                1 else "#2196F3",
-                width=5)
-
-            # Voeg eindmarker toe
-            if len(route_coords) > 1:
-                end_lat, end_lon = route_coords[-1]
-                if hasattr(self, 'eind_marker'):
-                    self.eind_marker.delete()
-                self.eind_marker = self.map_widget.set_marker(
-                    end_lat,
-                    end_lon,
-                    text="Eindpunt",
-                    marker_color_circle="red",
-                    text_color="black")
-
-        except Exception as e:
-            messagebox.showerror("Fout", f"Route weergeven mislukt:\n{str(e)}")
-
-    def show_route_stats(self, G, route):
-        """Toon gedetailleerde route-statistieken."""
-        total_length = 0
-        road_types = {}
-
-        for i in range(len(route) - 1):
-            edge_data = G.get_edge_data(route[i], route[i + 1])[0]
-            total_length += edge_data['length']
-            hw_type = edge_data.get('highway', 'unknown')
-            road_types[hw_type] = road_types.get(hw_type,
-                                                 0) + edge_data['length']
-
-        stats = "\n".join(
-            f"{k}: {v/1000:.1f} km ({v/total_length*100:.0f}%)"
-            for k, v in sorted(road_types.items(), key=lambda x: -x[1]))
-
-        messagebox.showinfo(
-            "Route-informatie",
-            f"Totale afstand: {total_length/1000:.1f} km\n\nWegtypen:\n{stats}"
+    def _is_way_allowed(self, tags):
+        """Bepaal of weg expliciet toegestaan is"""
+        name = str(tags.get('name', '')).lower()
+        access = str(tags.get('access', '')).lower()
+        return (
+            'bromfietspad' in name or
+            'moped=yes' in access or
+            'moped=designated' in access
         )
 
-    def clear_all(self):
-        """Wis alle ingevoerde data"""
-        self.start_address_entry.delete(0, tk.END)
-        self.end_address_entry.delete(0, tk.END)
-        if self.start_marker:
-            self.start_marker.delete()
-            self.start_marker = None
-        if self.end_marker:
-            self.end_marker.delete()
-            self.end_marker = None
-        if self.route_line:
-            self.route_line.delete()
-            self.route_line = None
+    def _calculate_weight(self, tags):
+        """Gewichtberekening met wegklassen"""
+        highway = tags.get('highway', '')
+        if highway == 'residential':
+            return 2
+        elif highway == 'service':
+            return 3
+        return 1
 
+    def _find_nearest_node(self, coords):
+        """Verbeterde nearest-node met KDTree voor snelheid"""
+        if not hasattr(self, '_coords_tree'):
+            from sklearn.neighbors import KDTree
+            self._node_ids = list(self.nodes.keys())
+            self._coords_tree = KDTree(list(self.nodes.values()))
+        
+        _, idx = self._coords_tree.query([coords], k=1)
+        return self._node_ids[idx[0][0]]
+
+    def _process_route(self, node_path, is_fallback=False):
+        """Converteer node path naar coördinaten en stats"""
+        route_coords = []
+        allowed_segments = 0
+        total_segments = len(node_path)-1
+        
+        for i in range(total_segments):
+            u, v = node_path[i], node_path[i+1]
+            if self.graph.has_edge(u, v):
+                edge_data = self.graph[u][v]
+                route_coords.extend(edge_data['coords'])
+                if self._is_way_allowed(edge_data['tags']):
+                    allowed_segments += 1
+        
+        stats = {
+            'distance': f"{self._calculate_route_length(route_coords)/1000:.1f} km",
+            'quality': f"{(allowed_segments/total_segments)*100:.0f}%",
+            'is_fallback': is_fallback
+        }
+        return route_coords, stats
+
+    def _calculate_route_length(self, coords):
+        """Bereken totale route lengte"""
+        return sum(great_circle(coords[i], coords[i+1]).meters 
+                  for i in range(len(coords)-1))
+
+
+def analyze_route_quality(G, route):
+    """Analyseer hoeveel van de route ideaal is"""
+    total_length = 0
+    perfect_length = 0
+    good_length = 0
+    poor_length = 0
+    
+    for i in range(len(route)-1):
+        edge_data = G.get_edge_data(route[i], route[i+1])[0]
+        length = edge_data['length']
+        total_length += length
+        
+        if 'bromfietspad' in str(edge_data.get('name', '')).lower():
+            perfect_length += length
+        elif 'moped=yes' in str(edge_data.get('access', '')).lower():
+            good_length += length
+        else:
+            poor_length += length
+    
+    return {
+        'total': f"{total_length/1000:.1f} km",
+        'perfect': f"{(perfect_length/total_length)*100:.0f}%",
+        'good': f"{(good_length/total_length)*100:.0f}%",
+        'poor': f"{(poor_length/total_length)*100:.0f}%"
+    }
+
+def calculate_route_stats(G, route):
+    """Bereken route-statistieken"""
+    total_length = 0
+    road_types = {}
+    
+    for i in range(len(route)-1):
+        edge_data = G.get_edge_data(route[i], route[i+1])[0]
+        total_length += edge_data['length']
+        hw_type = edge_data.get('highway', 'unknown')
+        
+        # Oplossing voor lijst als wegtype
+        if isinstance(hw_type, list):
+            hw_type = hw_type[0] if hw_type else 'unknown'
+        
+        road_types[hw_type] = road_types.get(hw_type, 0) + edge_data['length']
+    
+    stats = {
+        'distance': f"{total_length/1000:.1f} km",
+        'road_types': "\n".join(
+            f"{k}: {v/1000:.1f} km ({v/total_length*100:.0f}%)" 
+            for k, v in sorted(road_types.items(), key=lambda x: -x[1]))
+    }
+    return stats
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    map_obj = folium.Map(location=[52.3676, 4.9041], zoom_start=14)
+    planner = ScooterRoutePlanner()
+    messages = []
+    
+    if request.method == "POST":
+        start_address = request.form["start_address"]
+        end_address = request.form["end_address"]
+        
+        try:
+            start_coords = get_coordinates(start_address)
+            end_coords = get_coordinates(end_address)
+            
+            if start_coords and end_coords:
+                route_coords, stats = planner.calculate_route(start_coords, end_coords)
+                
+                # Route tekenen
+                folium.PolyLine(
+                    route_coords,
+                    color='orange' if stats['is_fallback'] else 'blue',
+                    weight=6 if stats['is_fallback'] else 5,
+                    opacity=0.7,
+                    tooltip=f"Kwaliteit: {stats['quality']}"
+                ).add_to(map_obj)
+                
+                # Markers
+                folium.Marker(start_coords, popup="Start", icon=folium.Icon(color='green')).add_to(map_obj)
+                folium.Marker(end_coords, popup="Eind", icon=folium.Icon(color='red')).add_to(map_obj)
+                
+                map_obj.fit_bounds([start_coords, end_coords])
+                messages.append(f"Route: {stats['distance']}")
+                messages.append(f"Kwaliteit: {stats['quality']} toegestane wegen")
+                if stats['is_fallback']:
+                    messages.append("⚠️ Minder optimale route gebruikt")
+                
+        except Exception as e:
+            messages.append(f"Fout: {str(e)}")
+            # Toon beschikbare wegen voor debug
+            debug_layer = folium.FeatureGroup(name="Beschikbare wegen")
+            for u, v, data in planner.graph.edges(data=True):
+                folium.PolyLine(
+                    data['coords'],
+                    color='gray',
+                    weight=1,
+                    opacity=0.3
+                ).add_to(debug_layer)
+            debug_layer.add_to(map_obj)
+    
+    return render_template_string(
+        HTML_TEMPLATE,
+        map_html=map_obj._repr_html_(),
+        start_address=start_address if 'start_address' in locals() else "",
+        end_address=end_address if 'end_address' in locals() else "",
+        route_stats="<br>".join(messages) if messages else ""
+    )
+
+    
+    return render_template_string(
+        HTML_TEMPLATE,
+        map_html=map_obj._repr_html_(),
+        start_address=start_address,
+        end_address=end_address,
+        route_stats=route_stats,
+        road_types=road_types
+    )
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = ScooterNavigator(root)
-    root.mainloop()
+    app.run(host="0.0.0.0", port=8080)
